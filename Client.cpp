@@ -1,64 +1,115 @@
-#include <unistd.h>
+#include <iostream>
 #include <arpa/inet.h>
 #include <string>
 #include <string.h>
-#include <iostream>
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/un.h>
-#include "Common.h"
+#include <sys/uio.h>
+#include <sys/socket.h>
+#include "check.hpp"
+
+#define CONTROLLEN CMSG_LEN(sizeof(int))
+#define CL_OPEN "open"
+#define MAXLINE 4096
+
+static struct cmsghdr *cmptr = NULL;
 
 class Client{
     int _socket;
-    void Send(){
-        struct ucred cred;
-        cred.uid = getuid();
-        int buff = cred.uid;
-        //std::cout<<"UID: " << buff;
-        if(!try_send(_socket, buff)) return;
 
-        Request request;
-        request.target_uid = buff;
-        request.mode = S_IRUSR;
-        strcpy(request.name, "test.txt");
-        request.rights = R_READ;
-        if(!try_send(_socket, request)) return;
+    int send_request(char *name, int oflag){
+        pid_t pid;
+        int len;
+        char buf[10];
+        struct iovec iov[3];
+        static int fd[2] = {-1, -1};
+
+        sprintf(buf, " %d", oflag);
+        iov[0].iov_base = (void*)CL_OPEN;
+        iov[0].iov_len = strlen(CL_OPEN) + 1;
+        iov[1].iov_base = name;
+        iov[1].iov_len = strlen(name);
+        iov[2].iov_base = buf;
+        iov[2].iov_len = strlen(buf) + 1;
+        len = iov[0].iov_len + iov[1].iov_len + iov[2].iov_len;
+
+        if(writev(_socket, &iov[0], 3) != len){
+            return -1;
+        }
+        return recv_fd(write);
     }
-public:
-    void start(const char* name){
-        sockaddr_un un, sun;
 
-        if (strlen(name) >= sizeof(un.sun_path)) errno = ENAMETOOLONG;
+public:
+    Client(const char* name){
+        sockaddr_un un;
+
+        if(strlen(name) >= sizeof(un.sun_path)) errno = ENAMETOOLONG;
 
         _socket = check(socket(AF_UNIX, SOCK_STREAM, 0));
 
         memset(&un, 0, sizeof(un));
         un.sun_family = AF_UNIX;
-        sprintf(un.sun_path, "%s%05ld", "var/tmp", (long)getpid());
-        int len = offsetof(struct sockaddr_un, sun_path) + strlen(un.sun_path);
+        strcpy(un.sun_path, name);
+        int len = offsetof(sockaddr_un, sun_path) + strlen(name);
 
-        unlink(un.sun_path);
-        check(bind(_socket, (struct sockaddr*)&un, len));
+        check(connect(_socket, (sockaddr*)&un, len));
 
-        chmod(un.sun_path, S_IRWXU);
+        char line[4096];
+        fgets(line, 4096, stdin);
+        int fd_recv = send_request(line, O_RDONLY);
 
-        memset(&sun, 0, sizeof(sun));
-        sun.sun_family = AF_UNIX;
-        strcpy(sun.sun_path, name);
-        len = offsetof(struct sockaddr_un, sun_path) + strlen(name);
-        check(connect(_socket, (struct sockaddr*)&sun, len));
+        std::cout<<fd_recv;
+        close(_socket);
+    }
 
-        /*_socket = check(socket(AF_UNIX, SOCK_STREAM, 0));
-        sockaddr_in addr{};
-        addr.sin_family = AF_UNIX;
-        addr.sin_port = htons(port);
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        check(connect(_socket, (sockaddr*)&addr, sizeof(addr)));
+    int recv_fd(ssize_t (*userfunc)(int, const void*, size_t)){
+        int newfd, nr, status;
+        char *ptr;
+        char buf[MAXLINE];
+        struct iovec iov[1];
+        struct msghdr msg;
 
-        Send();
-        close(_socket);*/
+        status = -1;
+
+        for(;;){
+            iov[0].iov_base = buf;
+            iov[0].iov_len = sizeof(buf);
+            msg.msg_iov = iov;
+            msg.msg_iovlen = 1;
+            msg.msg_name = NULL;
+            msg.msg_namelen = 0;
+            if(cmptr == NULL && (cmptr = (struct cmsghdr*)malloc(CONTROLLEN)) == NULL) return -1;
+            msg.msg_control = cmptr;
+            msg.msg_controllen = CONTROLLEN;
+
+            if((nr = recvmsg(_socket, &msg, 0)) < 0){
+                return -1;
+            }
+            else{
+                if(nr == 0) return -1;
+            }
+
+            for(ptr = buf; ptr <&buf[nr];){
+                if(*ptr++ == 0){
+                    if(ptr != &buf[nr - 1]) std::cout<<"Message format violation";
+                    status = *ptr & 0xFF;
+
+                    if(status == 0){
+                        if(msg.msg_controllen < CONTROLLEN) std::cout<<"received code 0, but fd is missing";
+                        newfd = *(int *) CMSG_DATA(cmptr);
+                    }
+                    else newfd = -status;
+                    nr -= 2;
+                }
+            }
+
+            if(nr > 0 && (*userfunc)(STDERR_FILENO, buf, nr) != nr) return -1;
+            if(status >= 0) return(newfd);
+        }
     }
 };
 
 int main(){
-    Client client;
-    client.start("Server");
+    Client client("Server");
 }
